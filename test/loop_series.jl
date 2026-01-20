@@ -58,24 +58,26 @@ end
 
 @testset "cycle basis on Petersen graph" begin
     g = Graphs.SimpleGraphs.smallgraph(:petersen)
-    basis = minimal_loops(g)
-    rank = ne(g) - nv(g) + length(connected_components(g))
-    @test length(basis.cycles) == rank
-    lengths = count_ones.(basis.cycles)
-    @test minimum(lengths) == 5
-    @test all(len -> len >= 5, lengths)
-    @test gf2_rank(basis.cycles, length(basis.edges)) == rank
+    eds = [(min(src(e), dst(e)), max(src(e), dst(e))) for e in edges(g)]
+    sort!(eds)
     edge_index = Dict{Tuple{Int, Int}, Int}()
-    for (i, (u, v)) in enumerate(basis.edges)
+    for (i, (u, v)) in enumerate(eds)
         edge_index[(u, v)] = i
         edge_index[(v, u)] = i
     end
-    masks = Set{eltype(basis.cycles)}()
+    basis_cycles = [cycle_mask(c, edge_index, TensorInference.bitmask_type(length(eds))) for c in cycle_basis(g)]
+    rank = ne(g) - nv(g) + length(connected_components(g))
+    @test length(basis_cycles) == rank
+    lengths = count_ones.(basis_cycles)
+    @test minimum(lengths) == 5
+    @test all(len -> len >= 5, lengths)
+    @test gf2_rank(basis_cycles, length(eds)) == rank
+    masks = Set{eltype(basis_cycles)}()
     for cyc in simplecycles(DiGraph(g))
         length(cyc) < 3 && continue
-        push!(masks, cycle_mask(cyc, edge_index, eltype(basis.cycles)))
+        push!(masks, cycle_mask(cyc, edge_index, eltype(basis_cycles)))
     end
-    basis_vecs, pivots = gf2_basis(basis.cycles, length(basis.edges))
+    basis_vecs, pivots = gf2_basis(basis_cycles, length(eds))
     for mask in masks
         @test iszero(reduce_with_basis(mask, basis_vecs, pivots))
     end
@@ -96,7 +98,28 @@ function cycle_uai(tensors::Vector{Matrix{T}}) where {T}
     return TensorInference.UAIModel(n, cards, factors)
 end
 
-_scalar(x) = x isa AbstractArray && ndims(x) == 0 ? x[] : x
+function disjoint_cycle_uai(tensors1::Vector{Matrix{T}}, tensors2::Vector{Matrix{T}}) where {T}
+    n1 = length(tensors1)
+    n2 = length(tensors2)
+    d1 = size(tensors1[1], 1)
+    d2 = size(tensors2[1], 1)
+    size(tensors1[1], 1) == size(tensors1[1], 2) || throw(ArgumentError("tensors1 must be square"))
+    size(tensors2[1], 1) == size(tensors2[1], 2) || throw(ArgumentError("tensors2 must be square"))
+    all(t -> size(t, 1) == d1 && size(t, 2) == d1, tensors1) || throw(ArgumentError("dimension mismatch in tensors1"))
+    all(t -> size(t, 1) == d2 && size(t, 2) == d2, tensors2) || throw(ArgumentError("dimension mismatch in tensors2"))
+    cards = vcat(fill(d1, n1), fill(d2, n2))
+    factors = Vector{TensorInference.Factor{T, 2}}(undef, n1 + n2)
+    for i in 1:n1
+        j = i == n1 ? 1 : i + 1
+        factors[i] = TensorInference.Factor((i, j), tensors1[i])
+    end
+    offset = n1
+    for i in 1:n2
+        j = i == n2 ? 1 : i + 1
+        factors[offset + i] = TensorInference.Factor((offset + i, offset + j), tensors2[i])
+    end
+    return TensorInference.UAIModel(n1 + n2, cards, factors)
+end
 
 edge_key(u::Int, v::Int) = u < v ? (u, v) : (v, u)
 
@@ -127,15 +150,12 @@ function graph_uai(g::SimpleGraph, bond_dim::Int; rng::AbstractRNG = Random.defa
     return TensorInference.UAIModel(length(eds), fill(bond_dim, length(eds)), factors)
 end
 
-exact_weight(uai) = _scalar(probability(TensorNetworkModel(uai)))
+exact_weight(uai) = probability(TensorNetworkModel(uai))[]
 
-function run_loop_expansion(uai; max_iter::Int = 500, tol::Real = 1e-8, K::Int = 1)
+function run_bp(uai; max_iter::Int = 500, tol::Real = 1e-8)
     bp = BeliefPropgation(uai)
     state, info = belief_propagate(bp; max_iter, tol)
-    loops = loop_basis(bp)
-    bp_weight = bp_vacuum_weight(bp, state)
-    result = loop_expansion(bp, state; loops, K)
-    return bp, state, info, loops, bp_weight, result
+    return bp, state, info, bp_vacuum_weight(bp, state)
 end
 
 function random_cyclic_graph(n::Int, m::Int; rng::AbstractRNG = Random.default_rng(), max_tries::Int = 100)
@@ -160,29 +180,78 @@ end
     A = [0.2 0.9; 0.9 0.2]
     tensors = [A for _ in 1:5]
     uai = cycle_uai(tensors)
-    _, _, info, loops, bp_weight, result = run_loop_expansion(uai; max_iter=500, tol=1e-10, K=1)
+    bp, state, info, bp_weight = run_bp(uai; max_iter=500, tol=1e-10)
     @test info.converged
-
-    @test length(loops) == 1
-    @test count_ones(loops[1].edges) == 5
 
     exact = tr(A^5)
     @test !isapprox(bp_weight, exact; atol=1e-6, rtol=1e-6)
-    @test result.value ≈ exact atol=1e-6
+
+    strategies = [
+        ("basis", loop_basis(bp)),
+        ("xor", loop_series(bp, XORLoopSum(1))),
+        ("union", loop_series(bp, UnionLoopSum(1))),
+        ("degree", loop_series(bp, Degree(5))),
+        ("cyclomatic", loop_series(bp, Cyclomatic(1))),
+    ]
+    for (name, loops) in strategies
+        @testset "$name" begin
+            @test length(loops) == 1
+            @test count_ones(loops[1].edges) == 5
+            result = loop_corrections(bp, state; loops)
+            @info "exact: $exact, BP: $bp_weight, loop corrected: $(result.value)"
+            @test !isapprox(bp_weight, exact; atol=1e-6, rtol=1e-6)
+            @test result.value ≈ exact atol=1e-6
+        end
+    end
 end
 
-@testset "loop expansion on Petersen random tensors" begin
-    rng = MersenneTwister(17)
+@testset "loop expansion on disjoint cycles" begin
+    A = [0.2 0.9; 0.9 0.2]
+    tensors1 = [A for _ in 1:5]
+    tensors2 = [A for _ in 1:5]
+    uai = disjoint_cycle_uai(tensors1, tensors2)
+    bp, state, info, bp_weight = run_bp(uai; max_iter=500, tol=1e-10)
+    @test info.converged
+    exact = tr(A^5)^2
+    @test !isapprox(bp_weight, exact; atol=1e-6, rtol=1e-6)
+
+    strategies = [
+        ("basis", loop_basis(bp)),
+        ("degree", loop_series(bp, Degree(5))),
+        ("cyclomatic", loop_series(bp, Cyclomatic(1))),
+        ("xor", loop_series(bp, XORLoopSum(1))),
+        ("union", loop_series(bp, UnionLoopSum(2))),
+    ]
+    for (name, loops) in strategies
+        @testset "$name" begin
+            @test length(loops) == 2
+            result_single = loop_corrections(bp, state; loops, n_edges_trunc = 5, n_loops_trunc = 1)
+            @test !isapprox(result_single.value, exact; atol=1e-6, rtol=1e-6)
+            result_multi = loop_corrections(bp, state; loops, n_edges_trunc = 10, n_loops_trunc = 2)
+            @test result_multi.value ≈ exact atol=1e-6
+        end
+    end
+end
+
+@testset "loop expansion on Petersen graph" begin
+    rng = MersenneTwister(42)
     g = Graphs.SimpleGraphs.smallgraph(:petersen)
     uai = graph_uai(g, 2; rng)
-    _, _, info, loops, bp_weight, result = run_loop_expansion(uai; max_iter=500, tol=1e-8, K=1)
+    bp, state, info, bp_weight = run_bp(uai; max_iter=500, tol=1e-8)
     @test info.converged
-
-    @test !isempty(loops)
 
     exact = exact_weight(uai)
     @test !isapprox(bp_weight, exact; atol=1e-6, rtol=1e-6)
-    @test isfinite(bp_weight) && isfinite(result.value) && isfinite(exact)
+
+    for trunc in [Degree(12), Cyclomatic(4)] 
+        @testset "$(nameof(typeof(trunc)))" begin
+            @time loops = loop_series(bp, trunc)
+            @test !isempty(loops)
+            @time result = loop_corrections(bp, state; loops)
+            @info "exact: $exact, BP: $bp_weight, loop corrected: $(result.value)"
+            @test result.value ≈ exact atol=1e-6
+        end
+    end
 end
 
 @testset "loop expansion on random simple graphs" begin
@@ -190,11 +259,17 @@ end
         rng = MersenneTwister(seed)
         g = random_cyclic_graph(n, m; rng)
         uai = graph_uai(g, 2; rng)
-        _, _, info, loops, bp_weight, result = run_loop_expansion(uai; max_iter=600, tol=1e-8, K=1)
+        bp, state, info, bp_weight = run_bp(uai; max_iter=1600, tol=1e-12)
         @test info.converged
-        @test !isempty(loops)
         exact = exact_weight(uai)
         @test !isapprox(bp_weight, exact; atol=1e-6, rtol=1e-6)
-        @test isfinite(bp_weight) && isfinite(result.value) && isfinite(exact)
+        for trunc in (Degree(ne(g)), Cyclomatic(1))
+            @testset "$(nameof(typeof(trunc)))" begin
+                loops = loop_series(bp, trunc)
+                @test !isempty(loops)
+                result = loop_corrections(bp, state; loops)
+                @test isfinite(bp_weight) && isfinite(result.value) && isfinite(exact)
+            end
+        end
     end
 end
