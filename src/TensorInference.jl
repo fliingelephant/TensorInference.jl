@@ -44,6 +44,7 @@ export update_temperature
 
 # belief propagation
 export BeliefPropgation, belief_propagate
+export CycleBasis, LoopExcitation, minimal_loops, loop_basis, loop_weight, bp_vacuum_weight, loop_expansion
 
 # fileio
 export save_tensor_network, load_tensor_network
@@ -60,6 +61,7 @@ include("mmap.jl")
 include("sampling.jl")
 include("cspmodels.jl")
 include("belief.jl")
+include("loop_series.jl")
 include("fileio.jl")
 
 end # module
